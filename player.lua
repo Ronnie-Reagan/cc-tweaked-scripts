@@ -441,7 +441,7 @@ local function drawUI()
         term.write("Vol. " .. bar)
 
         term.setCursorPos(width - 16, 2)
-        term.write(volume .. "% / " .. range .. "00%")
+        term.write(volume * 100 .. "% / " .. range .. "00%")
     end
 end
 
