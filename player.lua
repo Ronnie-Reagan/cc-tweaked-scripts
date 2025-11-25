@@ -374,16 +374,17 @@ local function keyWatcher()
     end
 end
 
+
 local function getVolumeSymbol(v)
-    if v < 1 then return "x"
-    elseif v < 2 then return "X"
+    if v <= 1 then return "x"
+    elseif v <= 2 then return "X"
     else return "!"
     end
 end
 
 local function getVolumeRange(v)
-    if v < 1 then return 1
-    elseif v < 2 then return 2
+    if v <= 1 then return 1
+    elseif v <= 2 then return 2
     else return 3
     end
 end
