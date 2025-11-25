@@ -373,69 +373,77 @@ local function keyWatcher()
         end
     end
 end
-local function getVolumeSymbol(vol)
-    if vol < 1 then
-        return "x"
-    elseif vol < 2 then
-        return "X"
-    else
-        return "!"
+
+local function getVolumeSymbol(v)
+    if v < 1 then return "x"
+    elseif v < 2 then return "X"
+    else return "!"
     end
 end
 
-local function getVolumeRange(vol)
-    if vol < 1 then
-        return "1"
-    elseif vol < 2 then
-        return "2"
-    else
-        return "3"
+local function getVolumeRange(v)
+    if v < 1 then return 1
+    elseif v < 2 then return 2
+    else return 3
     end
 end
+
+local function buildVolumeBar(vol)
+    local maxUnits = 10
+
+    -- determine symbol and range
+    local symbol = getVolumeSymbol(vol)
+    local range  = getVolumeRange(vol)
+
+    -- local percentage inside that range only
+    local localStart = range - 1          -- 0, 1, or 2
+    local localEnd   = range              -- 1, 2, or 3
+
+    -- normalize to 0–1 inside its own bucket
+    local localPct = (vol - localStart) / (localEnd - localStart)
+    if localPct < 0 then localPct = 0 end
+    if localPct > 1 then localPct = 1 end
+
+    local units = math.floor(localPct * maxUnits + 0.001)
+
+    return "|" .. string.rep(symbol, units) .. string.rep("_", maxUnits - units) .. "|",
+           symbol,
+           range,
+           math.floor(localPct * 100)
+end
+
 
 local function drawUI()
     while true do
-        os.sleep()
+        os.sleep(0.25)
 
         local timeDisplay = textutils.formatTime(os.time("local"))
         local width, height = term.getSize()
 
         local songLines = wrap(currentSong, width - 2)
-        local symbol = getVolumeSymbol(volume)
-        local range  = getVolumeRange(volume)
-        local volPct = math.floor(volume * 100)
 
-        -- Build volume bar: up to 10 units
-        local maxUnits = 10
-        local units = math.floor(math.min(volume, 3) / 3 * maxUnits)
-        local bar = "|" .. string.rep(symbol, units) .. string.rep("_", maxUnits - units) .. "|"
+        local bar, symbol, range, pct = buildVolumeBar(volume)
 
         term.clear()
 
-        -- Clock
         term.setCursorPos(1, 1)
         term.write(timeDisplay)
 
-        -- Song header
         term.setCursorPos(1, 3)
         term.write("Now Playing:")
 
-        -- Song text
         for i = 1, #songLines do
             term.setCursorPos(2, i + 4)
             term.write(songLines[i])
         end
 
-        -- Volume bar
         term.setCursorPos(width - (#bar + 4), 1)
         term.write("Vol. " .. bar)
 
-        -- Volume numeric
         term.setCursorPos(width - 16, 2)
-        term.write(volPct .. "% / " .. range .. "00%")
+        term.write(pct .. "% / " .. range .. "00%")
     end
 end
-
 
 --------------------------------------------------------------------
 --  Initialization
