@@ -1,6 +1,12 @@
 ---------------------------------------------------------------------
 -- logging.lua
--- Minimal but correct architecture: Logger -> Handlers -> Formatter
+
+-- Goals:
+--  • No uncaught errors
+--  • All handler and formatter operations protected
+--  • Safe fallback behaviors
+--  • No template explosions
+--  • Always-working traceback logic
 ---------------------------------------------------------------------
 
 local logging = {}
@@ -15,15 +21,27 @@ logging.levels = {
     ERROR    = 40,
     CRITICAL = 50,
 }
--- traceback configuration
+
+-- enable traceback for high-severity messages
 logging.includeTraceOn = {
     ERROR    = true,
     CRITICAL = true,
 }
 
+---------------------------------------------------------------------
+-- safe traceback builder
+---------------------------------------------------------------------
 local function buildTraceback(message)
-    local tb = debug.traceback(message, 3)
-    return tb
+    -- debug may be missing in sandboxed Lua
+    if type(debug) ~= "table" or type(debug.traceback) ~= "function" then
+        return "[traceback unavailable] " .. tostring(message)
+    end
+
+    local ok, tb = pcall(debug.traceback, message, 3)
+    if ok and type(tb) == "string" then
+        return tb
+    end
+    return "[traceback failed] " .. tostring(message)
 end
 
 ---------------------------------------------------------------------
@@ -33,13 +51,20 @@ local Formatter = {}
 Formatter.__index = Formatter
 
 function Formatter:new(template)
+    -- enforce safe template
     return setmetatable({
-        template = template or "%(asctime)s [%(level)s] %(message)s"
+        template = type(template) == "string"
+            and template
+            or "%(asctime)s [%(level)s] %(message)s"
     }, self)
 end
 
 function Formatter:format(levelName, message)
-    local t = os.date("*t")
+    local ok, t = pcall(os.date, "*t")
+    if not ok or type(t) ~= "table" then
+        t = {year=0,month=0,day=0,hour=0,min=0,sec=0}
+    end
+
     local ts = string.format(
         "%04d-%02d-%02d %02d:%02d:%02d",
         t.year, t.month, t.day,
@@ -47,6 +72,8 @@ function Formatter:format(levelName, message)
     )
 
     local out = self.template
+
+    -- safe gsubs
     out = out:gsub("%%%(asctime%)s", ts)
     out = out:gsub("%%%(level%)s", levelName)
     out = out:gsub("%%%(message%)s", message)
@@ -71,8 +98,17 @@ end
 
 function ConsoleHandler:emit(levelName, levelValue, message)
     if levelValue < self.level then return end
-    local formatted = self.formatter:format(levelName, message)
-    print(formatted)
+
+    local ok, formatted = pcall(self.formatter.format, self.formatter, levelName, message)
+    if not ok then
+        formatted = "[formatter error] " .. tostring(message)
+    end
+
+    local okPrint = pcall(print, formatted)
+    if not okPrint then
+        -- absolutely cannot allow a print failure to kill logging
+        -- fallback: nothing
+    end
 end
 
 ------------------------- FileHandler ------------------------------
@@ -81,7 +117,7 @@ FileHandler.__index = FileHandler
 
 function FileHandler:new(path, level, formatter)
     return setmetatable({
-        path      = path or "log.txt",
+        path      = tostring(path or "log.txt"),
         level     = level or logging.levels.DEBUG,
         formatter = formatter or Formatter:new()
     }, self)
@@ -89,12 +125,20 @@ end
 
 function FileHandler:emit(levelName, levelValue, message)
     if levelValue < self.level then return end
-    local formatted = self.formatter:format(levelName, message)
-    local f = io.open(self.path, "a")
-    if f then
-        f:write(formatted .. "\n")
-        f:close()
+
+    local ok, formatted = pcall(self.formatter.format, self.formatter, levelName, message)
+    if not ok then
+        formatted = "[formatter error] " .. tostring(message)
     end
+
+    local f, err = io.open(self.path, "a")
+    if not f then
+        -- Fail silently. Logging must never break the program.
+        return
+    end
+
+    local _ = f:write(formatted .. "\n")
+    f:close()
 end
 
 ---------------------------------------------------------------------
@@ -105,56 +149,64 @@ Logger.__index = Logger
 
 function Logger:new(name, level)
     return setmetatable({
-        name     = name or "root",
+        name     = tostring(name or "root"),
         level    = level or logging.levels.DEBUG,
         handlers = {}
     }, self)
 end
 
 function Logger:addHandler(handler)
-    table.insert(self.handlers, handler)
+    if type(handler) == "table" and handler.emit then
+        self.handlers[#self.handlers+1] = handler
+    end
 end
 
+-- INTERNAL LOGGER CORE
 function Logger:_log(levelName, parts)
     local levelValue = logging.levels[levelName]
+    if not levelValue then return end
     if levelValue < self.level then return end
 
-    -- join message parts
+    -- safe stringify
     local msgParts = {}
     for i = 1, #parts do
-        msgParts[#msgParts+1] = tostring(parts[i])
+        local p = parts[i]
+        if p == nil then p = "nil" end
+        msgParts[#msgParts+1] = tostring(p)
     end
     local message = table.concat(msgParts, " ")
 
-    -- include traceback if configured
+    -- optional traceback
     if logging.includeTraceOn[levelName] then
         message = buildTraceback(message)
     end
 
-    -- dispatch to handlers
-    for _, handler in ipairs(self.handlers) do
-        handler:emit(levelName, levelValue, message)
+    -- handler dispatch (individually protected)
+    for i = 1, #self.handlers do
+        local handler = self.handlers[i]
+        pcall(handler.emit, handler, levelName, levelValue, message)
     end
 end
 
+-- LEVEL METHODS
 function Logger:debug(...)      self:_log("DEBUG",      {...}) end
 function Logger:info(...)       self:_log("INFO",       {...}) end
 function Logger:warn(...)       self:_log("WARNING",    {...}) end
 function Logger:error(...)      self:_log("ERROR",      {...}) end
 function Logger:critical(...)   self:_log("CRITICAL",   {...}) end
-function Logger:exception(...)  self:_log("ERROR",      {...})  end
+function Logger:exception(...)  self:_log("ERROR",      {...}) end
+
 ---------------------------------------------------------------------
--- ROOT LOGGER
+-- FACTORY + ROOT
 ---------------------------------------------------------------------
 logging.root = Logger:new("root", logging.levels.DEBUG)
-logging.getLogger = function(name, level)
+
+function logging.getLogger(name, level)
     return Logger:new(name, level)
 end
 
--- Expose handlers + formatter
 logging.ConsoleHandler = ConsoleHandler
 logging.FileHandler    = FileHandler
 logging.Formatter      = Formatter
 
----------------------------------------------------------------------
 return logging
