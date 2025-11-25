@@ -2,7 +2,7 @@
 --  Logging
 --------------------------------------------------------------------
 local logging = require("logging")
-local log = logging.getLogger("core", logging.levels.DEBUG)
+local log = logging.getLogger("core", logging.levels.INFO)
 log:addHandler(logging.FileHandler:new())
 log:info("System Logging Started")
 
@@ -14,7 +14,8 @@ local dfpwm = require("cc.audio.dfpwm")
 local wrap = require("cc.strings").wrap
 
 if periphemu ~= nil then
-	print("Monitor created on top: " .. periphemu.create("top", "speaker"))
+	print("Speaker created on top: " .. periphemu.create("top", "speaker"))
+	os.sleep(1) -- to ensure reading time
 end
 
 --------------------------------------------------------------------
