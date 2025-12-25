@@ -7,9 +7,9 @@
 - Custom Logging Module - Built to emulate Python's logging module
 
 Instructions / Commands to install and run:
-- `wget https://raw.githubusercontent.com/Ronnie-Reagan/cc-tweaked-scripts/refs/heads/main/install-player.lua`
-- `install-player.lua`
-- `player.lua`
+- ```wget https://raw.githubusercontent.com/Ronnie-Reagan/cc-tweaked-scripts/refs/heads/main/install-player.lua```
+- ```install-player.lua```
+- ```player.lua```
 
 Repo : https://github.com/Ronnie-Reagan/cc-tweaked-scripts
 
