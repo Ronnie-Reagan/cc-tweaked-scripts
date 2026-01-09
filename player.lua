@@ -84,7 +84,7 @@ end
 
 function Speakers:update()
     local now = os.clock()
-    if now - self.lastRefresh >= self.refreshInterval then
+    if now - self.lastRefresh >= self.refreshInterval or (#self.list < 1 and now - self.lastRefresh >= 1.5) then
         self:refresh()
     end
 end
