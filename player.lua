@@ -7,37 +7,55 @@ log:addHandler(logging.FileHandler:new())
 log:info("System Logging Started")
 
 --------------------------------------------------------------------
---  Dependencies
+--  Dependencies / Display
 --------------------------------------------------------------------
+local mon = peripheral.wrap("top")
+local screenWidth, screenHeight
+
+if mon then
+    mon.setTextScale(1)
+    term.redirect(mon)
+    screenWidth, screenHeight = mon.getSize()
+else
+    screenWidth, screenHeight = term.getSize()
+end
+
 local json  = require("json")
 local dfpwm = require("cc.audio.dfpwm")
 local wrap  = require("cc.strings").wrap
-if not http then return error("no http", 1) end
+
+-- For emulators (optional)
 if periphemu ~= nil then
-    print("Speaker created on top: " .. tostring(periphemu.create("top", "speaker")))
+    print("Speaker created on top: " .. periphemu.create("top", "speaker"))
     os.sleep(1) -- to ensure reading time
 end
 
 --------------------------------------------------------------------
 --  Globals / Config
 --------------------------------------------------------------------
-local closing = false
-local volume              = 1
-local skipRequested       = false
-local skipBack            = false
-local RECENT_TRACK_MEMORY = 32
-local CHUNK_MS            = 100 -- chunk time in ms; may need to be > tps
-local CHUNK_SIZE          = math.floor(48000 * (CHUNK_MS / 1000))
-local SUB_CHUNK_SIZE      = math.ceil(CHUNK_SIZE / 10)
-local SUB_CHUNKS          = 10
-local PLAY_AHEAD_MS       = 15
-local MAX_FRAMES_BUFFERED = 80
-local songs               = nil
-local recent              = {}
-local currentSong         = "Not Playing"
-local currentSongEpoch    = os.epoch("utc")
+local maxPlaybackErrors         = 5         -- Playback errors from speakers before resyncing speakers
+local volume                    = 1         -- Volume Float — 0.00 to 3.00 with 1.00 being 100% volume
+local skipRequested             = false     -- State Signal for Skip Forwards (simple)
+local skipBack                  = false     -- State Signal to Skip Backwards (simple)
+local RECENT_TRACK_MEMORY       = 32        -- Recent track count for shuffling: too high can consume excess memory
+local songs                     = nil       -- Fetched audio dictionary
+local recent                    = {}        -- Recently played song object
+local currentSong               = "Not Playing" -- Currently playing song name
 
--- helpers
+-- Audio timing / chunking
+local SAMPLE_RATE               = 48000                               -- DFPWM sample rate
+local CHUNK_MS                  = 50                                  -- Chunk size in time — should be at or above 50 for stability
+local SAMPLES_PER_CHUNK         = SAMPLE_RATE * (CHUNK_MS / 1000)     -- PCM smaples per chunk
+local BYTES_PER_CHUNK           = math.floor(SAMPLES_PER_CHUNK / 8)   -- 8 samples per byte
+local SUB_CHUNKS                = 10                                  -- Sub-Chunks for decoding
+local SUB_CHUNK_BYTES           = math.ceil(BYTES_PER_CHUNK / SUB_CHUNKS) -- PCM bytes per sub chunk
+local PLAY_AHEAD_MS             = 250                                 -- Offset ahead of now to send audio; to be played with wait—sync timing
+local MAX_BUFFERED_MS           = 2000                                -- Rolling buffer target, must be above play-ahead by atleast 50 ms
+
+
+--------------------------------------------------------------------
+--  Timing Helpers
+--------------------------------------------------------------------
 local function waitUntil(target_ms)
     while true do
         local now = os.epoch("utc")
@@ -53,6 +71,15 @@ local function waitUntil(target_ms)
     end
 end
 
+local function silenceFrame(ms)
+    local samples = math.floor(SAMPLE_RATE * (ms / 1000))
+    local pcm = {}
+    for i = 1, samples do
+        pcm[i] = 0
+    end
+    return pcm
+end
+
 --------------------------------------------------------------------
 --  Speaker Manager (OO Dynamic Peripheral Updater)
 --------------------------------------------------------------------
@@ -63,7 +90,7 @@ function Speakers:new(refreshInterval)
     return setmetatable({
         list            = {},
         lastRefresh     = 0,
-        refreshInterval = refreshInterval or 2
+        refreshInterval = refreshInterval or 2,
     }, Speakers)
 end
 
@@ -71,7 +98,7 @@ function Speakers:_scan()
     local found = { peripheral.find("speaker") }
     local list = {}
     for i = 1, #found do
-        list[i] = found[i]
+        list[i] = {object = found[i], bad = false, errors = 0, id = tostring("spk-" .. i)}
     end
     return list
 end
@@ -82,10 +109,32 @@ function Speakers:refresh()
     log:debug("Speaker list refreshed; count=" .. tostring(#self.list))
 end
 
+function Speakers:resetBad()
+    local silence = silenceFrame(330)
+
+    for _, entry in ipairs(self.list) do
+        if entry.bad then
+            for _ = 1, 3 do
+                local ok = entry.object.playAudio(silence, 1)
+                if ok then
+                    os.sleep(0.9 - _ * 0.1)
+                    break
+                end
+            end
+            entry.bad = false
+            entry.errors = 0
+            log:info("Speaker reset attmpted on device " .. entry.id .. " via silence")
+        end
+    end
+end
+
 function Speakers:update()
     local now = os.clock()
-    if now - self.lastRefresh >= self.refreshInterval or (#self.list < 1 and now - self.lastRefresh >= 1.5) then
+    if now - self.lastRefresh >= self.refreshInterval
+        or (#self.list < 1 and now - self.lastRefresh >= 1.5)
+    then
         self:refresh()
+        self:resetBad()
     end
 end
 
@@ -94,18 +143,33 @@ function Speakers:get()
     return self.list
 end
 
+-- Barrier-synchronized playback across all speakers
 function Speakers:blockingPlay(pcm, vol, time)
     local list = self:get()
+    if #list == 0 then
+        log:warn("No speakers available for playback.")
+        waitUntil(time)
+        return os.epoch("utc")
+    end
+
     waitUntil(time)
-    for _, spk in ipairs(list) do
-        if not spk.playAudio(pcm, vol or 1) then
-            return
+    for _, spk in pairs(list) do
+        if not spk.bad then
+            if not spk.object.playAudio(pcm, vol or 1) then
+                spk.errors = spk.errors + 1
+                if spk.errors >= maxPlaybackErrors then
+                    spk.bad = true
+                    log:warn("Speaker " .. spk.id .. " quarantined after " .. spk.errors .. " failures")
+                end
+                return os.epoch("utc")
+            end
         end
     end
+
     return os.epoch("utc")
 end
 
-local speakerManager = Speakers:new(60)
+local speakerManager = Speakers:new(10)
 
 --------------------------------------------------------------------
 --  Song List / Selection
@@ -115,9 +179,6 @@ local function loadSongList()
     local delay = 1
 
     while not songs do
-        term.clear()
-        term.setCursorPos(1, 1)
-        term.write("Attempting to load Songs... " .. (delay <= 2 and tostring(delay) or tostring(delay / delay)))
         log:info("Attempting to fetch song list...")
 
         local ok, res = pcall(http.get, URL)
@@ -130,13 +191,6 @@ local function loadSongList()
                 songs = decoded
                 break
             else
-                if delay >= 2 then
-                    local ccDecodeOK, ccDecoded = pcall(textutils.unserializeJSON, content)
-                    if ccDecodeOK and ccDecoded then
-                        songs = ccDecoded
-                        break
-                    end
-                end
                 log:critical("JSON decode error")
             end
         else
@@ -152,7 +206,7 @@ local function loadSongList()
 end
 
 local function pickNextSong()
-    if #songs == 0 then
+    if not songs or #songs == 0 then
         return nil
     end
 
@@ -161,14 +215,14 @@ local function pickNextSong()
         indices[i] = i
     end
 
-    -- Fisher-Yates
+    -- Fisher-Yates shuffle
     for i = #indices, 2, -1 do
         local j = math.random(i)
         indices[i], indices[j] = indices[j], indices[i]
     end
 
     for _, idx in ipairs(indices) do
-        if songs == nil then
+        if not songs then
             return nil
         end
         local song = songs[idx]
@@ -188,7 +242,7 @@ local function pickNextSong()
         end
     end
 
-    -- If all recent, pick random
+    -- If all are in recent, just pick random
     local choice = songs[math.random(#songs)]
     table.insert(recent, choice)
     if #recent > RECENT_TRACK_MEMORY then
@@ -198,50 +252,59 @@ local function pickNextSong()
 end
 
 local function fetchDFPWM(song)
-    if song.url and http then
+    if song and song.url and http then
         local ok, res = pcall(http.get, song.url)
         if ok and res then
             local data = res.readAll()
             res.close()
             return data
         else
-            log:warn("Failed to fetch song: " .. tostring(song.url))
+            log:warn("Failed to fetch song: " .. tostring(song and song.url))
         end
     end
     return nil
 end
 
 --------------------------------------------------------------------
---  Audio Playback
+--  Audio Playback Core
 --------------------------------------------------------------------
+
 local function playSong(songData)
     if skipRequested then
         skipRequested = false
     end
+
     if not songData then
         log:warn("playSong called with nil data")
         return
     end
 
-    local decoder        = dfpwm.make_decoder()
-    local schedule       = {}
-    local scheduleHead   = 1
-    local scheduleTail   = 0
-    local SONG_START     = os.epoch("utc")
-    local elapsed_ms     = 0
-    local decoderDone    = false
-    local dataPos        = 1
+    local decoder      = dfpwm.make_decoder()
+
+    -- Schedule: simple queue with head/tail
+    local schedule     = {}
+    local scheduleHead = 1
+    local scheduleTail = 0
+    local buffered_ms  = 0  -- total ms worth of frames queued
+
+    local SONG_START   = os.epoch("utc")
+    local elapsed_ms   = 0
+    local decoderDone  = false
+    local dataPos      = 1
 
     local function scheduleSize()
         return scheduleTail - scheduleHead + 1
     end
 
-    local function queueFrame(deadline, frame)
-        scheduleTail = scheduleTail + 1
-        schedule[scheduleTail] = {
+    local function queueFrame(deadline, frame, frame_ms)
+        local idx = scheduleTail + 1
+        schedule[idx] = {
             deadline = deadline,
-            frame    = frame
+            frame    = frame,
+            frame_ms = frame_ms,
         }
+        scheduleTail = idx
+        buffered_ms = buffered_ms + (frame_ms or 0)
     end
 
     local function peekFrame()
@@ -262,24 +325,31 @@ local function playSong(songData)
             scheduleHead = 1
             scheduleTail = 0
         end
+        buffered_ms = buffered_ms - (item.frame_ms or 0)
+        if buffered_ms < 0 then
+            buffered_ms = 0
+        end
         return item
     end
 
+    -- read encoded DFPWM sub-chunk (bytes)
     local function readSubChunk()
         if dataPos > #songData then
             return nil
         end
-        local chunk = songData:sub(dataPos, dataPos + SUB_CHUNK_SIZE - 1)
+        local chunk = songData:sub(dataPos, dataPos + SUB_CHUNK_BYTES - 1)
         dataPos = dataPos + #chunk
         return chunk
     end
 
+    -- decode one PCM "frame" ≈ CHUNK_MS ms, in SUB_CHUNKS small reads
     local function decodeFrame()
         local pcmAll = {}
 
         for _ = 1, SUB_CHUNKS do
             local encoded = readSubChunk()
-            if not encoded then
+            if not encoded or #encoded == 0 then
+                -- End of data; return partial frame if we have any samples
                 return (#pcmAll > 0) and pcmAll or nil
             end
 
@@ -291,11 +361,23 @@ local function playSong(songData)
             end
         end
 
+        if #pcmAll == 0 then
+            return nil
+        end
         return pcmAll
     end
 
+    -- Decoder Task: build schedule with time-based buffering
     local function decoderTask()
         while true do
+            if skipRequested then
+                break
+            end
+
+            -- Respect max buffered time
+            while buffered_ms >= MAX_BUFFERED_MS and not skipRequested do
+                os.sleep(0)
+            end
             if skipRequested then
                 break
             end
@@ -306,36 +388,35 @@ local function playSong(songData)
                 break
             end
 
-            local frame_ms = (#frame / 48000) * 1000
+            local frame_ms = (#frame / SAMPLE_RATE) * 1000
             elapsed_ms = elapsed_ms + frame_ms
 
             local deadline = SONG_START + math.floor(elapsed_ms + PLAY_AHEAD_MS)
-            while scheduleSize() >= MAX_FRAMES_BUFFERED and not skipRequested do
-                os.sleep(0)
-            end
-            if skipRequested then
-                break
-            end
-            queueFrame(deadline, frame)
 
+            queueFrame(deadline, frame, frame_ms)
+
+            -- yield to let playback task catch up
             os.sleep()
         end
     end
 
+    -- Playback Task: wait for deadlines & feed speakers in sync
     local function playbackTask()
         while true do
             if skipRequested then
                 break
             end
-            local frame = peekFrame()
 
-            if frame then
-                speakerManager:blockingPlay(frame.frame, volume, frame.deadline)
+            local item = peekFrame()
+            if item then
+                speakerManager:blockingPlay(item.frame, volume, item.deadline)
                 popFrame()
             elseif decoderDone then
+                -- No frames and decoder is done —> song finished
+                os.sleep(PLAY_AHEAD_MS)
                 break
             else
-                os.sleep(0)
+                os.sleep(1.5)
             end
         end
     end
@@ -352,8 +433,13 @@ local function audioTask()
     while true do
         local song
         if skipBack then
-            song = recent[math.max(1, #recent - 1)]
-            skipBack = false
+            -- previous song in recent list
+            if #recent > 1 then
+                song = recent[math.max(1, #recent - 1)]
+            else
+                song = pickNextSong()
+            end
+            skipBack      = false
             skipRequested = false
         else
             song = pickNextSong()
@@ -362,14 +448,122 @@ local function audioTask()
         if song then
             local data = fetchDFPWM(song)
             if data then
-                currentSong      = song.title or "Untitled"
-                currentSongEpoch = os.epoch("utc")  -- sync animation to song start
+                currentSong = song.title or "Unknown Title"
                 playSong(data)
             else
                 log:warn("Song fetch failed; retry in 1s")
                 os.sleep(1)
             end
+        else
+            log:warn("No songs available; retry in 5s")
+            os.sleep(5)
         end
+    end
+end
+
+--------------------------------------------------------------------
+--  UI / Input
+--------------------------------------------------------------------
+local buttons = {
+    [1] = {
+        symbol = "Vol +",
+        label  = "Vol +",
+        x      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return screenWidth - 5
+        end,
+        width  = 5,
+        y      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return screenHeight - 2
+        end,
+        height = 1,
+        func   = function()
+            volume = math.min(3, volume + 0.05)
+        end,
+    },
+
+    [2] = {
+        symbol = "Vol -",
+        label  = "Vol -",
+        x      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return screenWidth - 5
+        end,
+        width  = 5,
+        y      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return screenHeight - 1
+        end,
+        height = 1,
+        func   = function()
+            volume = math.max(0, volume - 0.05)
+        end,
+    },
+
+    [3] = {
+        symbol = "<<<",
+        label  = "back",
+        x      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return 1
+        end,
+        width  = 6,
+        y      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return screenHeight - 1
+        end,
+        height = 1,
+        func   = function()
+            skipBack      = true
+            skipRequested = true
+        end,
+    },
+
+    [4] = {
+        symbol = ">>>",
+        label  = "skip",
+        x      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return 7
+        end,
+        width  = 6,
+        y      = function()
+            local x, y = term.getSize()
+            screenWidth, screenHeight = x, y
+            return screenHeight - 1
+        end,
+        height = 1,
+        func   = function()
+            skipRequested = true
+        end,
+    },
+}
+
+local function activateButton(x, y)
+    for _, button in pairs(buttons) do
+        local bx, by = button.x(), button.y()
+        if x >= bx and x <= bx + button.width - 1 and
+            y >= by and y <= by + button.height - 1 then
+            button.func()
+        end
+    end
+end
+
+local function touchWatcher()
+    log:info("Touch-Watcher starting")
+    while true do
+        local event, side, x, y = os.pullEvent("monitor_touch")
+        activateButton(x, y)
+        log:info("Monitor Touch on side '" .. tostring(side)
+            .. "' at X/Y " .. tostring(x) .. "/" .. tostring(y))
     end
 end
 
@@ -381,15 +575,12 @@ local function keyWatcher()
         if key == keys.right then
             skipRequested = true
         elseif key == keys.left then
-            skipBack = true
+            skipBack      = true
             skipRequested = true
         elseif key == keys.up then
             volume = math.min(3, volume + 0.05)
         elseif key == keys.down then
             volume = math.max(0, volume - 0.05)
-        elseif key == keys.q then
-            closing = true
-            break
         end
     end
 end
@@ -398,251 +589,97 @@ end
 --  Volume Bar Helpers
 --------------------------------------------------------------------
 local function getVolumeSymbol(v)
-    if v <= 1 then return "x"
-    elseif v <= 2 then return "X"
-    else return "!"
+    if v <= 1 then
+        return "x"
+    elseif v <= 2 then
+        return "X"
+    else
+        return "!"
     end
 end
 
 local function getVolumeRange(v)
-    if v <= 1 then return 1
-    elseif v <= 2 then return 2
-    else return 3
+    if v <= 1 then
+        return 1
+    elseif v <= 2 then
+        return 2
+    else
+        return 3
     end
 end
 
 local function buildVolumeBar(vol)
-    local maxUnits = 10
+    local maxUnits   = 10
 
-    local symbol = getVolumeSymbol(vol)
-    local range  = getVolumeRange(vol)
+    local symbol     = getVolumeSymbol(vol)
+    local range      = getVolumeRange(vol)
 
-    local localStart = range - 1
-    local localEnd   = range
+    local localStart = range - 1 -- 0, 1, 2
+    local localEnd   = range     -- 1, 2, 3
 
-    local localPct = (vol - localStart) / (localEnd - localStart)
+    local localPct   = (vol - localStart) / (localEnd - localStart)
     if localPct < 0 then localPct = 0 end
     if localPct > 1 then localPct = 1 end
 
     local units = math.floor(localPct * maxUnits + 0.001)
 
-    return "|" .. string.rep(symbol, units) .. string.rep("_", maxUnits - units) .. "|",
-           symbol,
-           range,
-           math.floor(localPct * 100)
+    local bar = "|" .. string.rep(symbol, units)
+        .. string.rep("_", maxUnits - units) .. "|"
+
+    return bar, symbol, range, math.floor(localPct * 100 + 0.5)
 end
 
---------------------------------------------------------------------
---  Functional Animation + Layout System (Integrated)
---------------------------------------------------------------------
-local function now()
-    return os.epoch("utc")
-end
-
-local function elapsed_ms(startEpoch)
-    return now() - startEpoch
-end
-
-local function getSize()
-    return term.getSize()
-end
-
--- bounce-offset for horizontal scrolling:
--- textLen > maxWidth: scroll left→right, pause, right→left, pause
-local function bounceOffset(epochEntered, textLen, maxWidth, speed, pause)
-    if textLen <= maxWidth then
-        return 0
-    end
-
-    local maxShift = textLen - maxWidth
-    local cycle    = 2 * (maxShift / speed) + 2 * pause
-    local t        = (elapsed_ms(epochEntered) / 1000) % cycle
-
-    -- left pause
-    if t < pause then
-        return 0
-    end
-    t = t - pause
-
-    local forwardTime = maxShift / speed
-    if t < forwardTime then
-        return math.floor(t * speed)
-    end
-    t = t - forwardTime
-
-    -- right pause
-    if t < pause then
-        return maxShift
-    end
-    t = t - pause
-
-    local backTime = forwardTime
-    if t < backTime then
-        return maxShift - math.floor(t * speed)
-    end
-
-    return 0
-end
-
-local function clearRegion(x, y, width)
-    term.setCursorPos(x, y)
-    term.write((" "):rep(width))
-end
-
-local function drawAt(x, y, text)
-    term.setCursorPos(x, y)
-    term.write(text)
-end
-
-local function drawScrollingText(text, x, y, maxWidth, epoch)
-    if maxWidth <= 0 then return end
-    text = text or ""
-    clearRegion(x, y, maxWidth)
-
-    local len = #text
-    local off = bounceOffset(epoch, len, maxWidth, 8, 1.0) -- 8 chars/s, 1s pause
-
-    local slice = text:sub(1 + off, off + maxWidth)
-    drawAt(x, y, slice)
-end
-
-local function makeLayout()
-    local w, h = getSize()
-    local third = math.floor(w / 3)
-
-    return {
-        header = {
-            clock = {
-                x        = 1,
-                y        = 1,
-                maxWidth = math.max(8, third - 2),
-            },
-            title = {
-                x        = third + 1,
-                y        = 1,
-                maxWidth = third - 2,
-            },
-            volumeBar = {
-                x        = (third * 2) + 1,
-                y        = 1,
-                maxWidth = third - 2,
-            },
-        },
-        body = {
-            startY    = 3,
-            rowHeight = 1,
-            rows      = h - 2,
-        }
-    }
-end
-
-local function renderHeader(layout, pageNum, epoch, state)
-    local H = layout.header
-
-    -- clock (static)
-    local clockText = state.timeDisplay or ""
-    clearRegion(H.clock.x, H.clock.y, H.clock.maxWidth)
-    drawAt(H.clock.x, H.clock.y, clockText:sub(1, H.clock.maxWidth))
-
-    -- title (scrolling)
-    drawScrollingText(
-        state.headerTitle or "",
-        H.title.x,
-        H.title.y,
-        H.title.maxWidth,
-        epoch
-    )
-
-    -- volume bar (static text region)
-    local volStr = "Vol. " .. (state.volumeBarText or "")
-    clearRegion(H.volumeBar.x, H.volumeBar.y, H.volumeBar.maxWidth)
-    drawAt(H.volumeBar.x, H.volumeBar.y, volStr:sub(1, H.volumeBar.maxWidth))
-end
-
-local function renderBody(layout, items, epoch)
-    local B = layout.body
-    local w, _ = getSize()
-
-    local maxWidth = math.max(1, w - 2)
-    local rows = math.min(#items, B.rows)
-
-    for i = 1, rows do
-        local y = B.startY + (i - 1) * B.rowHeight
-        drawScrollingText(items[i], 2, y, maxWidth, epoch + (i * 97))
-    end
-end
-
-local function buildForm(pageNumber, epochEnteredPage)
-    local layout = makeLayout()
-
-    return function(state)
-        term.clear()
-        renderHeader(layout, pageNumber, epochEnteredPage, state)
-        renderBody(layout, state.rows or {}, epochEnteredPage)
-    end
-end
-
---------------------------------------------------------------------
---  UI Task (Animated, Functional)
---------------------------------------------------------------------
 local function drawUI()
-    local pageNumber = 1
-    local lastEpoch  = nil
-    local form       = nil
-
     while true do
-        os.sleep(0.05)
-
-        local epoch = currentSongEpoch or now()
-        if not form or epoch ~= lastEpoch then
-            form = buildForm(pageNumber, epoch)
-            lastEpoch = epoch
-        end
+        os.sleep(0.25)
 
         local timeDisplay = textutils.formatTime(os.time("local"))
+        local width, height = term.getSize()
+        screenWidth, screenHeight = width, height
 
-        local vb = { buildVolumeBar(volume) }
-        local barText, symbol, range, pct =
-            vb[1], vb[2], vb[3], vb[4]
+        local songLines = wrap(currentSong, width - 2)
 
-        local rows = {
-            "Now Playing:",
-            currentSong,
-            "",
-            ("Volume: %d%% (range %d00%%, symbol %s)"):format(volume * 100, range, symbol),
-            "Left/Right: next / previous track",
-            "Up/Down : volume",
-        }
+        local bar, symbol, range, pct = buildVolumeBar(volume)
 
-        local state = {
-            headerTitle   = "Don-Player",
-            volume        = volume,
-            timeDisplay   = timeDisplay,
-            volumeBarText = barText,
-            rows          = rows,
-        }
+        term.clear()
 
-        form(state)
+        -- Clock
+        term.setCursorPos(1, 1)
+        term.write(timeDisplay)
+
+        -- Now Playing
+        term.setCursorPos(1, 3)
+        term.write("Now Playing:")
+
+        for i = 1, #songLines do
+            term.setCursorPos(2, i + 4)
+            term.write(songLines[i])
+        end
+
+        -- Volume bar (right side)
+        term.setCursorPos(width - (#bar + 4), 1)
+        term.write("Vol. " .. bar)
+
+        term.setCursorPos(width - 16, 2)
+        local volPct = math.floor(volume * 100 + 0.5)
+        term.write(string.format("%3d%% / %d00%%", volPct, range))
+
+        -- Buttons
+        for _, button in pairs(buttons) do
+            term.setCursorPos(button.x(), button.y())
+            term.write(button.symbol or button.label)
+        end
     end
 end
 
 --------------------------------------------------------------------
---  Initialization
+--  Initialization / Main
 --------------------------------------------------------------------
 local seed = os.epoch("utc") % 100000
 math.randomseed(seed)
 log:debug("Seed = " .. seed)
 
 loadSongList()
-parallel.waitForAny(audioTask, keyWatcher, drawUI)
-
-if not closing then
-    log:exception("Script reached end unexpectedly.")
-else
-    term.clear()
-    term.setCursorPos(1, 1)
-    term.write("Thank you for using my player")
-    term.setCursorPos(1, 2)
-    term.write("simply enter 'player' in the terminal to start again!")
-    term.setCursorPos(1, 3)
-end
+speakerManager:update()
+os.sleep(0.25)
+parallel.waitForAny(audioTask, keyWatcher, touchWatcher, drawUI)
