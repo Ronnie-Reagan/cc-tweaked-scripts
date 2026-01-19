@@ -2,7 +2,7 @@
 --  Logging
 --------------------------------------------------------------------
 local logging = require("logging")
-local log = logging.getLogger("core", logging.levels.DEBUG)
+local log = logging.getLogger("core", logging.levels.WARNING)
 log:addHandler(logging.FileHandler:new())
 log:info("System Logging Started")
 
